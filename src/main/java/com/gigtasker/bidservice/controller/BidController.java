@@ -20,19 +20,18 @@ public class BidController {
     @PostMapping
     public Mono<ResponseEntity<BidDTO>> placeBid(@RequestBody BidDTO bidRequest) {
         return bidService.placeBid(bidRequest)
-                // ".map()" is how you transform the result inside a Mono
                 .map(createdBid -> new ResponseEntity<>(createdBid, HttpStatus.CREATED));
     }
 
     @GetMapping("/task/{taskId}")
-    public ResponseEntity<List<BidDetailDTO>> getBidsForTask(@PathVariable Long taskId) {
-        List<BidDetailDTO> bids = bidService.getBidsForTask(taskId);
-        return ResponseEntity.ok(bids);
+    public Mono<ResponseEntity<List<BidDetailDTO>>> getBidsForTask(@PathVariable Long taskId) {
+        return bidService.getBidsForTask(taskId).map(ResponseEntity::ok);
     }
 
     @PostMapping("/{bidId}/accept")
-    public ResponseEntity<Void> acceptBid(@PathVariable Long bidId) {
-        bidService.acceptBid(bidId);
-        return ResponseEntity.ok().build(); // Return a 200 OK
+    public Mono<ResponseEntity<Void>> acceptBid(@PathVariable Long bidId) {
+        // .map() is for transforming a value.
+        // .thenReturn() is for replacing a "complete" signal.
+        return bidService.acceptBid(bidId).thenReturn(ResponseEntity.ok().build());
     }
 }

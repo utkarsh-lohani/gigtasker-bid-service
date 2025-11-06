@@ -27,6 +27,6 @@ public class Bid {
     @Enumerated(EnumType.STRING) @Builder.Default
     private BidStatus status = BidStatus.PENDING;
 
-    @Column(columnDefinition = "TEXT") // Use TEXT for longer descriptions
+    @Column(columnDefinition = "TEXT")
     private String proposal;
 }
