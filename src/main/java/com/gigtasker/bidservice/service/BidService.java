@@ -1,9 +1,6 @@
 package com.gigtasker.bidservice.service;
 
-import com.gigtasker.bidservice.dto.BidDTO;
-import com.gigtasker.bidservice.dto.BidDetailDTO;
-import com.gigtasker.bidservice.dto.TaskDTO;
-import com.gigtasker.bidservice.dto.UserDTO;
+import com.gigtasker.bidservice.dto.*;
 import com.gigtasker.bidservice.entity.Bid;
 import com.gigtasker.bidservice.enums.BidStatus;
 import com.gigtasker.bidservice.enums.TaskStatus;
@@ -178,8 +175,50 @@ public class BidService {
                             }).subscribeOn(Schedulers.boundedElastic())
                     );
             // We add a final .then() to the *entire chain* to
-            //  explicitly signal that the final result is Mono<Void>. This is what satisfies the compiler.
+            // explicitly signal that the final result is Mono<Void>. This is what satisfies the compiler.
         }).then();
+    }
+
+    @Transactional(readOnly = true)
+    public Mono<List<MyBidDetailDTO>> getMyBids() {
+        String token = getAuthToken();
+
+        // 1. First, find out who "I" am
+        return getUser(token)
+                .flatMap(currentUser -> {
+
+                    // 2. Now that we have the ID, get all respective bids from the DB
+                    // This is blocking, so we put it on the I/O pool
+                    Mono<List<Bid>> myBidsMono = Mono.fromCallable(() ->
+                            bidRepository.findByBidderUserId(currentUser.getId())
+                    ).subscribeOn(Schedulers.boundedElastic());
+
+                    return myBidsMono.flatMap(myBids -> {
+                        if (myBids.isEmpty()) {
+                            return Mono.just(List.<MyBidDetailDTO>of());
+                        }
+
+                        // 3. Extract the Task IDs from my bids
+                        List<Long> taskIds = myBids.stream()
+                                .map(Bid::getTaskId)
+                                .distinct()
+                                .toList();
+
+                        // 4. Call the task-service's new /batch endpoint
+                        // (This returns a Mono<Map<Long, TaskDTO>>)
+                        return getBatchTasks(token, taskIds)
+                                .map(taskMap -> {
+                                    // 5. "Zip" the data
+                                    return myBids.stream().map(bid -> {
+                                        TaskDTO task = taskMap.get(bid.getTaskId());
+                                        String title = (task != null) ? task.getTitle() : "Task Not Found";
+                                        TaskStatus status = (task != null) ? task.getStatus() : null;
+
+                                        return MyBidDetailDTO.fromEntity(bid, title, status);
+                                    }).collect(Collectors.toList());
+                                });
+                    });
+                });
     }
 
     // --- Helper Methods ---
@@ -226,5 +265,17 @@ public class BidService {
                 .header("Authorization", "Bearer " + token)
                 .retrieve()
                 .bodyToMono(Void.class);
+    }
+
+    private Mono<Map<Long, TaskDTO>> getBatchTasks(String token, List<Long> taskIds) {
+        return webClientBuilder.build()
+                .post()
+                .uri("http://task-service/api/v1/tasks/batch") // <-- Our new endpoint!
+                .header("Authorization", "Bearer " + token)
+                .bodyValue(taskIds)
+                .retrieve()
+                .bodyToMono(new ParameterizedTypeReference<List<TaskDTO>>() {})
+                .map(tasks -> tasks.stream()
+                        .collect(Collectors.toMap(TaskDTO::getId, task -> task))); // Convert to Map
     }
 }

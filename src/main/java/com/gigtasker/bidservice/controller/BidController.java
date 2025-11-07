@@ -2,6 +2,7 @@ package com.gigtasker.bidservice.controller;
 
 import com.gigtasker.bidservice.dto.BidDTO;
 import com.gigtasker.bidservice.dto.BidDetailDTO;
+import com.gigtasker.bidservice.dto.MyBidDetailDTO;
 import com.gigtasker.bidservice.service.BidService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
@@ -33,5 +34,10 @@ public class BidController {
         // .map() is for transforming a value.
         // .thenReturn() is for replacing a "complete" signal.
         return bidService.acceptBid(bidId).thenReturn(ResponseEntity.ok().build());
+    }
+
+    @GetMapping("/my-bids")
+    public Mono<ResponseEntity<List<MyBidDetailDTO>>> getMyBids() {
+        return bidService.getMyBids().map(ResponseEntity::ok);
     }
 }
