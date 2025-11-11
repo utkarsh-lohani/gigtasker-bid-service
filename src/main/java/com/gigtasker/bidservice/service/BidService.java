@@ -34,6 +34,8 @@ public class BidService {
     public static final String BID_PLACED_KEY = "bid.placed";
     public static final String BID_ACCEPTED_KEY = "bid.accepted";
     public static final String BID_REJECTED_KEY = "bid.rejected";
+    public static final String AUTHORIZATION = "Authorization";
+    public static final String AUTHORIZATION_BEARER = "Bearer ";
 
     @Transactional
     public Mono<BidDTO> placeBid(BidDTO bidRequest) {
@@ -101,24 +103,21 @@ public class BidService {
 
                     return bidsMono.flatMap(bids -> {
                         if (bids.isEmpty()) {
-                            return Mono.just(List.<BidDetailDTO>of());
+                            return Mono.just(List.of());
                         }
 
                         List<Long> bidderIds = bids.stream().map(Bid::getBidderUserId).distinct().toList();
 
                         // getBatchUsers is already non-blocking, so this is safe
                         return getBatchUsers(token, bidderIds)
-                                .map(userMap -> {
-                                    // This "zip" logic is fast (just memory)
-                                    return bids.stream().map(bid -> {
-                                        UserDTO bidder = userMap.get(bid.getBidderUserId());
-                                        String bidderName = (bidder != null)
-                                                ? bidder.getFirstName() + " " + bidder.getLastName()
-                                                : "Unknown User";
-
-                                        return BidDetailDTO.fromEntity(bid, bidderName);
-                                    }).collect(Collectors.toList());
-                                });
+                            .map(userMap ->
+                            // NO "return" or "{}", this is now a direct expression
+                                bids.stream().map(bid -> {
+                                    UserDTO bidder = userMap.get(bid.getBidderUserId());
+                                    String bidderName = (bidder != null)  ? bidder.getFirstName() + " " + bidder.getLastName() : "Unknown User";
+                                    return BidDetailDTO.fromEntity(bid, bidderName); // Assuming this factory exists
+                                }).toList()
+                        );
                     });
                 });
     }
@@ -207,16 +206,15 @@ public class BidService {
                         // 4. Call the task-service's new /batch endpoint
                         // (This returns a Mono<Map<Long, TaskDTO>>)
                         return getBatchTasks(token, taskIds)
-                                .map(taskMap -> {
-                                    // 5. "Zip" the data
-                                    return myBids.stream().map(bid -> {
-                                        TaskDTO task = taskMap.get(bid.getTaskId());
-                                        String title = (task != null) ? task.getTitle() : "Task Not Found";
-                                        TaskStatus status = (task != null) ? task.getStatus() : null;
-
-                                        return MyBidDetailDTO.fromEntity(bid, title, status);
-                                    }).collect(Collectors.toList());
-                                });
+                            .map(taskMap ->
+                            // NO "return" or "{}", this is now a direct expression
+                                myBids.stream().map(bid -> {
+                                    TaskDTO task = taskMap.get(bid.getTaskId());
+                                    String title = (task != null) ? task.getTitle() : "Task Not Found";
+                                    TaskStatus status = (task != null) ? task.getStatus() : null;
+                                    return MyBidDetailDTO.fromEntity(bid, status, title);
+                                }).toList()
+                            );
                     });
                 });
     }
@@ -232,7 +230,7 @@ public class BidService {
         return webClientBuilder.build()
                 .get()
                 .uri("http://user-service/api/v1/users/me")
-                .header("Authorization", "Bearer " + token)
+                .header(AUTHORIZATION, AUTHORIZATION_BEARER + token)
                 .retrieve()
                 .bodyToMono(UserDTO.class);
     }
@@ -241,7 +239,7 @@ public class BidService {
         return webClientBuilder.build()
                 .get()
                 .uri("http://task-service/api/v1/tasks/" + taskId)
-                .header("Authorization", "Bearer " + token)
+                .header(AUTHORIZATION, AUTHORIZATION_BEARER + token)
                 .retrieve()
                 .bodyToMono(TaskDTO.class);
     }
@@ -250,7 +248,7 @@ public class BidService {
         return webClientBuilder.build()
                 .post()
                 .uri("http://user-service/api/v1/users/batch")
-                .header("Authorization", "Bearer " + token)
+                .header(AUTHORIZATION, AUTHORIZATION_BEARER + token)
                 .bodyValue(bidderIds)
                 .retrieve()
                 .bodyToMono(new ParameterizedTypeReference<List<UserDTO>>() {})
@@ -262,7 +260,7 @@ public class BidService {
         return webClientBuilder.build()
                 .put()
                 .uri("http://task-service/api/v1/tasks/" + taskId + "/assign")
-                .header("Authorization", "Bearer " + token)
+                .header(AUTHORIZATION, AUTHORIZATION_BEARER + token)
                 .retrieve()
                 .bodyToMono(Void.class);
     }
@@ -271,7 +269,7 @@ public class BidService {
         return webClientBuilder.build()
                 .post()
                 .uri("http://task-service/api/v1/tasks/batch") // <-- Our new endpoint!
-                .header("Authorization", "Bearer " + token)
+                .header(AUTHORIZATION, AUTHORIZATION_BEARER + token)
                 .bodyValue(taskIds)
                 .retrieve()
                 .bodyToMono(new ParameterizedTypeReference<List<TaskDTO>>() {})
