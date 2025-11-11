@@ -7,8 +7,10 @@ import com.gigtasker.bidservice.enums.TaskStatus;
 import com.gigtasker.bidservice.exception.IllegalBidException;
 import com.gigtasker.bidservice.exception.UnauthorizedAccessException;
 import com.gigtasker.bidservice.repository.BidRepository;
-import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
@@ -22,13 +24,29 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
-@RequiredArgsConstructor
 public class BidService {
 
     private final BidRepository bidRepository;
     private final RabbitTemplate rabbitTemplate;
     private final WebClient.Builder webClientBuilder;
+
+    private BidService self;
+
+    // We will use @Lazy @Autowired setter for self-injection
+    // This breaks the "circular dependency" loop during startup.
+    @Autowired
+    @Lazy
+    public void setSelf(BidService self) {
+        this.self = self;
+    }
+
+    public BidService(BidRepository bidRepository, RabbitTemplate rabbitTemplate, WebClient.Builder webClientBuilder) {
+        this.bidRepository = bidRepository;
+        this.rabbitTemplate = rabbitTemplate;
+        this.webClientBuilder = webClientBuilder;
+    }
 
     public static final String EXCHANGE_NAME = "bid-exchange";
     public static final String BID_PLACED_KEY = "bid.placed";
@@ -126,56 +144,41 @@ public class BidService {
     public Mono<Void> acceptBid(Long bidId) {
         String token = getAuthToken();
 
-        // Get the winning bid (this is blocking, so we put it on the I/O pool)
-        Mono<Bid> winningBidMono = Mono.fromCallable(() -> bidRepository.findById(bidId)
-                        .orElseThrow(() -> new RuntimeException("Bid not found!"))
+        // Get the winning bid (blocking, so on I/O pool)
+        Mono<Bid> winningBidMono = Mono.fromCallable(() ->
+                bidRepository.findById(bidId).orElseThrow(() -> new RuntimeException("Bid not found!"))
         ).subscribeOn(Schedulers.boundedElastic());
 
-        // Get the current user (this is non-blocking)
+        // Get the current user (reactive)
         Mono<UserDTO> userMono = getUser(token);
 
-        // We'll "flatMap" off the winningBidMono
+        // Chain off the winningBid
         return winningBidMono.flatMap(winningBid ->
-                // Now we have the bid. Zip it with the user.
-                Mono.zip(Mono.just(winningBid), userMono)
-        ).flatMap(tuple -> {
-            // Now we have the bid AND the user.
+            // Now we have the bid. Zip it with the current user.
+            Mono.zip(Mono.just(winningBid), userMono)).flatMap(tuple -> {
+
+            // Now we have the bid + user. Get the task.
             Bid winningBid = tuple.getT1();
             UserDTO currentUser = tuple.getT2();
 
-            // Now, get the task (non-blocking)
-            return getTask(token, winningBid.getTaskId())
-                    .flatMap(task -> {
-                        // Now we have ALL 3. Do security check.
-                        if (!currentUser.getId().equals(task.getPosterUserId())) {
-                            return Mono.error(new UnauthorizedAccessException("You are not the owner of this task."));
-                        }
-                        if (!TaskStatus.OPEN.equals(task.getStatus())) {
-                            return Mono.error(new IllegalBidException("This task is no longer OPEN."));
-                        }
-                        // Checks passed. Assign the task (non-blocking).
-                        return assignTask(token, task.getId());
-                    })
-                    .then(
-                            // When assignment is done, do the FINAL blocking DB/RabbitMQ work
-                            Mono.fromRunnable(() -> {
-                                List<Bid> allBidsForTask = bidRepository.findByTaskId(winningBid.getTaskId());
-                                for (Bid bid : allBidsForTask) {
-                                    if (bid.getId().equals(winningBid.getId())) {
-                                        bid.setStatus(BidStatus.ACCEPTED);
-                                        bidRepository.save(bid);
-                                        rabbitTemplate.convertAndSend(EXCHANGE_NAME, BID_ACCEPTED_KEY, BidDTO.fromEntity(bid));
-                                    } else if (bid.getStatus() == BidStatus.PENDING) {
-                                        bid.setStatus(BidStatus.REJECTED);
-                                        bidRepository.save(bid);
-                                        rabbitTemplate.convertAndSend(EXCHANGE_NAME, BID_REJECTED_KEY, BidDTO.fromEntity(bid));
-                                    }
-                                }
-                            }).subscribeOn(Schedulers.boundedElastic())
-                    );
-            // We add a final .then() to the *entire chain* to
-            // explicitly signal that the final result is Mono<Void>. This is what satisfies the compiler.
-        }).then();
+            return getTask(token, winningBid.getTaskId()).flatMap(task -> { // <-- 'task' is now in scope for the rest of the chain
+                // Security Checks (fast, on event loop)
+                if (!currentUser.getId().equals(task.getPosterUserId())) {
+                    return Mono.error(new UnauthorizedAccessException("You are not the owner of this task."));
+                }
+                if (!TaskStatus.OPEN.equals(task.getStatus())) {
+                    return Mono.error(new IllegalBidException("This task is no longer OPEN."));
+                }
+
+                // 7. Assign the task (reactive)
+                return assignTask(token, task.getId()).then(
+                    // When assignment is done...
+                    // call our *final* transactional method.
+                    // 'winningBid' and 'task' are BOTH in scope.
+                    self.processAndNotifyBids(winningBid, task, token)
+                );
+            });
+        }).then(); // Final .then() to return Mono<Void> and satisfy the compiler
     }
 
     @Transactional(readOnly = true)
@@ -183,40 +186,86 @@ public class BidService {
         String token = getAuthToken();
 
         // 1. First, find out who "I" am
-        return getUser(token)
-                .flatMap(currentUser -> {
+        return getUser(token).flatMap(currentUser -> {
+            // 2. Now that we have the ID, get all respective bids from the DB
+            // This is blocking, so we put it on the I/O pool
+            Mono<List<Bid>> myBidsMono = Mono.fromCallable(() -> bidRepository.findByBidderUserId(currentUser.getId())).subscribeOn(Schedulers.boundedElastic());
 
-                    // 2. Now that we have the ID, get all respective bids from the DB
-                    // This is blocking, so we put it on the I/O pool
-                    Mono<List<Bid>> myBidsMono = Mono.fromCallable(() ->
-                            bidRepository.findByBidderUserId(currentUser.getId())
-                    ).subscribeOn(Schedulers.boundedElastic());
+            return myBidsMono.flatMap(myBids -> {
+                if (myBids.isEmpty()) {
+                    return Mono.just(List.of());
+                }
 
-                    return myBidsMono.flatMap(myBids -> {
-                        if (myBids.isEmpty()) {
-                            return Mono.just(List.<MyBidDetailDTO>of());
-                        }
+                // 3. Extract the Task IDs from my bids
+                List<Long> taskIds = myBids.stream()
+                        .map(Bid::getTaskId)
+                        .distinct()
+                        .toList();
 
-                        // 3. Extract the Task IDs from my bids
-                        List<Long> taskIds = myBids.stream()
-                                .map(Bid::getTaskId)
-                                .distinct()
-                                .toList();
+                // 4. Call the task-service's new /batch endpoint
+                // (This returns a Mono<Map<Long, TaskDTO>>)
+                return getBatchTasks(token, taskIds)
+                    .map(taskMap ->
+                    // NO "return" or "{}", this is now a direct expression
+                        myBids.stream().map(bid -> {
+                            TaskDTO task = taskMap.get(bid.getTaskId());
+                            String title = (task != null) ? task.getTitle() : "Task Not Found";
+                            TaskStatus status = (task != null) ? task.getStatus() : null;
+                            return MyBidDetailDTO.fromEntity(bid, status, title);
+                        }).toList()
+                    );
+            });
+        });
+    }
 
-                        // 4. Call the task-service's new /batch endpoint
-                        // (This returns a Mono<Map<Long, TaskDTO>>)
-                        return getBatchTasks(token, taskIds)
-                            .map(taskMap ->
-                            // NO "return" or "{}", this is now a direct expression
-                                myBids.stream().map(bid -> {
-                                    TaskDTO task = taskMap.get(bid.getTaskId());
-                                    String title = (task != null) ? task.getTitle() : "Task Not Found";
-                                    TaskStatus status = (task != null) ? task.getStatus() : null;
-                                    return MyBidDetailDTO.fromEntity(bid, status, title);
-                                }).toList()
-                            );
-                    });
-                });
+    @Transactional
+    public Mono<Void> processAndNotifyBids(Bid winningBid, TaskDTO task, String token) {
+        // This entire block of blocking code will run on the I/O pool
+        return Mono.fromRunnable(() -> {
+
+            // Get all bids for this task
+            List<Bid> allBidsForTask = bidRepository.findByTaskId(winningBid.getTaskId());
+
+            // Get all bidder IDs
+            List<Long> bidderIds = allBidsForTask.stream()
+                .map(Bid::getBidderUserId).distinct().toList();
+
+            // Call user-service (safe to .block() here, we're on the I/O pool)
+            Map<Long, UserDTO> userMap = getBatchUsers(token, bidderIds).block();
+            if (userMap == null) {
+                // We'll just log an error and continue
+                log.error("Failed to get bidder details. Notifications will not be sent.");
+                userMap = Map.of();
+            }
+
+            // Loop and send notifications
+            for (Bid bid : allBidsForTask) {
+                UserDTO bidder = userMap.get(bid.getBidderUserId());
+                // We can only notify users we found
+                if (bidder == null) continue;
+
+                BidNotificationDTO.BidNotificationDTOBuilder notification = BidNotificationDTO.builder()
+                    .bidId(bid.getId())
+                    .amount(bid.getAmount())
+                    .bidderUserId(bidder.getId())
+                    .bidderName(bidder.getFirstName() + " " + bidder.getLastName())
+                    .bidderEmail(bidder.getEmail()) // The Keycloak username
+                    .taskId(task.getId())
+                    .taskTitle(task.getTitle());
+
+                if (bid.getId().equals(winningBid.getId())) {
+                    bid.setStatus(BidStatus.ACCEPTED);
+                    rabbitTemplate.convertAndSend(EXCHANGE_NAME, BID_ACCEPTED_KEY, notification.status(BidStatus.ACCEPTED).build());
+
+                } else if (bid.getStatus() == BidStatus.PENDING) {
+                    bid.setStatus(BidStatus.REJECTED);
+                    rabbitTemplate.convertAndSend(EXCHANGE_NAME, BID_REJECTED_KEY,
+                            notification.status(BidStatus.REJECTED).build());
+                }
+
+                bidRepository.save(bid); // Save the status change
+            }
+        }).subscribeOn(Schedulers.boundedElastic()).then(); // .then() returns Mono<Void>
     }
 
     // --- Helper Methods ---
