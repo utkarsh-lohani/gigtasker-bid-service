@@ -171,7 +171,7 @@ public class BidService {
                 }
 
                 // 7. Assign the task (reactive)
-                return assignTask(token, task.getId()).then(
+                return assignTask(token, task.getId(), winningBid.getBidderUserId()).then(
                     // When assignment is done...
                     // call our *final* transactional method.
                     // 'winningBid' and 'task' are BOTH in scope.
@@ -305,11 +305,12 @@ public class BidService {
                         .collect(Collectors.toMap(UserDTO::getId, user -> user)));
     }
 
-    private Mono<Void> assignTask(String token, Long taskId) {
+    private Mono<Void> assignTask(String token, Long taskId, Long winningBidId) {
         return webClientBuilder.build()
                 .put()
                 .uri("http://task-service/api/v1/tasks/" + taskId + "/assign")
                 .header(AUTHORIZATION, AUTHORIZATION_BEARER + token)
+                .bodyValue(winningBidId)
                 .retrieve()
                 .bodyToMono(Void.class);
     }
