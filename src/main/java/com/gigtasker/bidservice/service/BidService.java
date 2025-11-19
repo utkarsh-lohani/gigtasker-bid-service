@@ -20,6 +20,8 @@ import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -75,28 +77,61 @@ public class BidService {
                     if (currentUser.getId().equals(task.getPosterUserId())) {
                         return Mono.error(new IllegalBidException("You cannot bid on your own gig."));
                     }
+                    if (task.getDeadline() != null && LocalDateTime.now().isAfter(task.getDeadline())) {
+                        return Mono.error(new IllegalBidException("The deadline for this task has passed."));
+                    }
+
+                    BigDecimal bidAmount = BigDecimal.valueOf(bidRequest.getAmount());
+
+                    if (task.getMinPay() != null && bidAmount.compareTo(task.getMinPay()) < 0) {
+                        return Mono.error(new IllegalBidException("Bid amount is lower than the minimum pay of $" + task.getMinPay()));
+                    }
+
+                    if (task.getMaxPay() != null && bidAmount.compareTo(task.getMaxPay()) > 0) {
+                        return Mono.error(new IllegalBidException("Bid amount is higher than the maximum pay of $" + task.getMaxPay()));
+                    }
+
+                    return Mono.fromCallable(() ->
+                            bidRepository.countByTaskIdAndBidderUserId(bidRequest.getTaskId(), currentUser.getId())
+                    ).subscribeOn(Schedulers.boundedElastic()).flatMap(count -> {
+
+                        // Use task's limit or default to 3
+                        int maxBids = (task.getMaxBidsPerUser() != null) ? task.getMaxBidsPerUser() : 3;
+
+                        if (count >= maxBids) {
+                            return Mono.error(new IllegalBidException("You have reached the maximum of " + maxBids + " bids for this task."));
+                        }
+
+                        // All checks passed? Save the bid.
+                        return this.saveBidInternal(bidRequest, currentUser);
+                    });
 
                     // We wrap our *blocking* code in a "Callable"
                     // and tell it to run on the 'boundedElastic' (I/O) thread pool.
-                    return Mono.fromCallable(() -> {
-                        Bid newBid = Bid.builder()
-                                .taskId(bidRequest.getTaskId())
-                                .bidderUserId(currentUser.getId())
-                                .amount(bidRequest.getAmount())
-                                .proposal(bidRequest.getProposal())
-                                .status(BidStatus.PENDING)
-                                .build();
-
-                        // This is blocking
-                        Bid savedBid = bidRepository.save(newBid);
-                        BidDTO savedDto = BidDTO.fromEntity(savedBid);
-
-                        // RabbitTemplate.convertAndSend is also blocking
-                        rabbitTemplate.convertAndSend(EXCHANGE_NAME, BID_PLACED_KEY, savedDto);
-
-                        return savedDto; // This is the result of our blocking work
-                    }).subscribeOn(Schedulers.boundedElastic()); // <-- The "Bridge"
                 });
+    }
+
+    private Mono<BidDTO> saveBidInternal(BidDTO bidRequest, UserDTO currentUser) {
+        // We wrap our *blocking* code in a "Callable"
+        // and tell it to run on the 'boundedElastic' (I/O) thread pool.
+        return Mono.fromCallable(() -> {
+            Bid newBid = Bid.builder()
+                    .taskId(bidRequest.getTaskId())
+                    .bidderUserId(currentUser.getId())
+                    .amount(bidRequest.getAmount())
+                    .proposal(bidRequest.getProposal())
+                    .status(BidStatus.PENDING)
+                    .build();
+
+            // This is blocking
+            Bid savedBid = bidRepository.save(newBid);
+            BidDTO savedDto = BidDTO.fromEntity(savedBid);
+
+            // RabbitTemplate.convertAndSend is also blocking
+            rabbitTemplate.convertAndSend(EXCHANGE_NAME, BID_PLACED_KEY, savedDto);
+
+            return savedDto; // This is the result of our blocking work
+        }).subscribeOn(Schedulers.boundedElastic()); // <-- The "Bridge"
     }
 
     @Transactional(readOnly = true)
