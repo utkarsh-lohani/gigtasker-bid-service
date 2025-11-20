@@ -26,12 +26,10 @@ public class SecurityConfig {
                 .csrf(AbstractHttpConfigurer::disable)
                 .formLogin(AbstractHttpConfigurer::disable)
                 .authorizeHttpRequests(authorize -> authorize
+                        // Permitting Health Checks
+                        .requestMatchers("/actuator/health/**").permitAll()
                         // Global Rules
                         .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
-
-                        // Service-Specific Rules (Example for notification-service only)
-                        // .requestMatchers("/ws/**").permitAll()
-
                         .anyRequest().authenticated()
                 )
                 .oauth2ResourceServer(oauth2 -> oauth2

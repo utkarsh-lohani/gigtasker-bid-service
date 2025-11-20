@@ -1,0 +1,8 @@
+spring:
+  application:
+    name: bid-service
+  config:
+    # 1. "optional:" means: if server is down, don't crash (good for local)
+    # 2. "configserver:" is the protocol
+    # 3. The URL
+    import: "optional:configserver:${CONFIG_SERVER_URL:http://localhost:8888}"

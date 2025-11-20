@@ -61,59 +61,62 @@ public class BidService {
     public Mono<BidDTO> placeBid(BidDTO bidRequest) {
         String token = getAuthToken();
 
-        // These network calls are already non-blocking. Perfect.
         Mono<UserDTO> userMono = getUser(token);
         Mono<TaskDTO> taskMono = getTask(token, bidRequest.getTaskId());
 
         return Mono.zip(userMono, taskMono)
                 .flatMap(tuple -> {
-                    // These checks are fast and run on the event loop.
                     UserDTO currentUser = tuple.getT1();
                     TaskDTO task = tuple.getT2();
 
-                    if (!TaskStatus.OPEN.equals(task.getStatus())) {
-                        return Mono.error(new IllegalBidException("This task is no longer OPEN."));
+                    return validateBid(bidRequest, currentUser, task)
+                            .then(checkBidLimit(bidRequest, currentUser, task))
+                            .then(saveBidInternal(bidRequest, currentUser));
+                });
+    }
+
+    private Mono<Void> validateBid(BidDTO bidRequest, UserDTO currentUser, TaskDTO task) {
+        return Mono.defer(() -> {
+            if (!TaskStatus.OPEN.equals(task.getStatus())) {
+                return Mono.error(new IllegalBidException("This task is no longer OPEN."));
+            }
+
+            if (currentUser.getId().equals(task.getPosterUserId())) {
+                return Mono.error(new IllegalBidException("You cannot bid on your own gig."));
+            }
+
+            if (task.getDeadline() != null && LocalDateTime.now().isAfter(task.getDeadline())) {
+                return Mono.error(new IllegalBidException("The deadline for this task has passed."));
+            }
+
+            BigDecimal amount = BigDecimal.valueOf(bidRequest.getAmount());
+
+            if (task.getMinPay() != null && amount.compareTo(task.getMinPay()) < 0) {
+                return Mono.error(new IllegalBidException("Bid amount is lower than the minimum pay of $" + task.getMinPay()));
+            }
+
+            if (task.getMaxPay() != null && amount.compareTo(task.getMaxPay()) > 0) {
+                return Mono.error(new IllegalBidException("Bid amount is higher than the maximum pay of $" + task.getMaxPay()));
+            }
+
+            return Mono.empty();
+        });
+    }
+
+    private Mono<Void> checkBidLimit(BidDTO bidRequest, UserDTO currentUser, TaskDTO task) {
+        return Mono.fromCallable(() ->
+                        bidRepository.countByTaskIdAndBidderUserId(bidRequest.getTaskId(), currentUser.getId())
+                ).subscribeOn(Schedulers.boundedElastic()).flatMap(count -> {
+                    int maxBids = (task.getMaxBidsPerUser() != null) ? task.getMaxBidsPerUser() : 3;
+
+                    if (count >= maxBids) {
+                        return Mono.error(new IllegalBidException("You have reached the maximum of " + maxBids + " bids for this task."));
                     }
-                    if (currentUser.getId().equals(task.getPosterUserId())) {
-                        return Mono.error(new IllegalBidException("You cannot bid on your own gig."));
-                    }
-                    if (task.getDeadline() != null && LocalDateTime.now().isAfter(task.getDeadline())) {
-                        return Mono.error(new IllegalBidException("The deadline for this task has passed."));
-                    }
-
-                    BigDecimal bidAmount = BigDecimal.valueOf(bidRequest.getAmount());
-
-                    if (task.getMinPay() != null && bidAmount.compareTo(task.getMinPay()) < 0) {
-                        return Mono.error(new IllegalBidException("Bid amount is lower than the minimum pay of $" + task.getMinPay()));
-                    }
-
-                    if (task.getMaxPay() != null && bidAmount.compareTo(task.getMaxPay()) > 0) {
-                        return Mono.error(new IllegalBidException("Bid amount is higher than the maximum pay of $" + task.getMaxPay()));
-                    }
-
-                    return Mono.fromCallable(() ->
-                            bidRepository.countByTaskIdAndBidderUserId(bidRequest.getTaskId(), currentUser.getId())
-                    ).subscribeOn(Schedulers.boundedElastic()).flatMap(count -> {
-
-                        // Use task's limit or default to 3
-                        int maxBids = (task.getMaxBidsPerUser() != null) ? task.getMaxBidsPerUser() : 3;
-
-                        if (count >= maxBids) {
-                            return Mono.error(new IllegalBidException("You have reached the maximum of " + maxBids + " bids for this task."));
-                        }
-
-                        // All checks passed? Save the bid.
-                        return this.saveBidInternal(bidRequest, currentUser);
-                    });
-
-                    // We wrap our *blocking* code in a "Callable"
-                    // and tell it to run on the 'boundedElastic' (I/O) thread pool.
+                    return Mono.empty();
                 });
     }
 
     private Mono<BidDTO> saveBidInternal(BidDTO bidRequest, UserDTO currentUser) {
-        // We wrap our *blocking* code in a "Callable"
-        // and tell it to run on the 'boundedElastic' (I/O) thread pool.
         return Mono.fromCallable(() -> {
             Bid newBid = Bid.builder()
                     .taskId(bidRequest.getTaskId())
@@ -123,15 +126,13 @@ public class BidService {
                     .status(BidStatus.PENDING)
                     .build();
 
-            // This is blocking
             Bid savedBid = bidRepository.save(newBid);
             BidDTO savedDto = BidDTO.fromEntity(savedBid);
 
-            // RabbitTemplate.convertAndSend is also blocking
             rabbitTemplate.convertAndSend(EXCHANGE_NAME, BID_PLACED_KEY, savedDto);
 
-            return savedDto; // This is the result of our blocking work
-        }).subscribeOn(Schedulers.boundedElastic()); // <-- The "Bridge"
+            return savedDto;
+        }).subscribeOn(Schedulers.boundedElastic());
     }
 
     @Transactional(readOnly = true)
