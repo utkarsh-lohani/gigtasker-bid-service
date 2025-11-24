@@ -17,6 +17,7 @@ import org.springframework.security.oauth2.server.resource.authentication.JwtAut
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
@@ -24,6 +25,7 @@ import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -180,42 +182,70 @@ public class BidService {
     public Mono<Void> acceptBid(Long bidId) {
         String token = getAuthToken();
 
-        // Get the winning bid (blocking, so on I/O pool)
-        Mono<Bid> winningBidMono = Mono.fromCallable(() ->
-                bidRepository.findById(bidId).orElseThrow(() -> new RuntimeException("Bid not found!"))
+        return loadBidContext(bidId, token)
+                .flatMap(this::validateContext)
+                .flatMap(ctx -> processPayment(ctx, token))
+                .flatMap(ctx -> finalizeOrder(ctx, token))
+                .then();
+    }
+
+    // --- Data Gathering (Build the Context) ---
+    private Mono<AcceptBidContext> loadBidContext(Long bidId, String token) {
+        // A. Get Bid (Blocking -> Reactive)
+        Mono<Bid> bidMono = Mono.fromCallable(() ->
+                bidRepository.findById(bidId)
+                        .orElseThrow(() -> new RuntimeException("Bid not found!"))
         ).subscribeOn(Schedulers.boundedElastic());
 
-        // Get the current user (reactive)
+        // B. Get User (Reactive)
         Mono<UserDTO> userMono = getUser(token);
 
-        // Chain off the winningBid
-        return winningBidMono.flatMap(winningBid ->
-            // Now we have the bid. Zip it with the current user.
-            Mono.zip(Mono.just(winningBid), userMono)).flatMap(tuple -> {
-
-            // Now we have the bid + user. Get the task.
-            Bid winningBid = tuple.getT1();
-            UserDTO currentUser = tuple.getT2();
-
-            return getTask(token, winningBid.getTaskId()).flatMap(task -> { // <-- 'task' is now in scope for the rest of the chain
-                // Security Checks (fast, on event loop)
-                if (!currentUser.getId().equals(task.getPosterUserId())) {
-                    return Mono.error(new UnauthorizedAccessException("You are not the owner of this task."));
-                }
-                if (!TaskStatus.OPEN.equals(task.getStatus())) {
-                    return Mono.error(new IllegalBidException("This task is no longer OPEN."));
-                }
-
-                // 7. Assign the task (reactive)
-                return assignTask(token, task.getId(), winningBid.getBidderUserId()).then(
-                    // When assignment is done...
-                    // call our *final* transactional method.
-                    // 'winningBid' and 'task' are BOTH in scope.
-                    self.processAndNotifyBids(winningBid, task, token)
-                );
-            });
-        }).then(); // Final .then() to return Mono<Void> and satisfy the compiler
+        // C. Combine Bid + User, then fetch Task
+        return Mono.zip(bidMono, userMono)
+                .flatMap(tuple -> {
+                    Bid bid = tuple.getT1();
+                    UserDTO user = tuple.getT2();
+                    return getTask(token, bid.getTaskId())
+                            .map(task -> new AcceptBidContext(bid, user, task));
+                });
     }
+
+    // --- Business Rule Validation ---
+    private Mono<AcceptBidContext> validateContext(AcceptBidContext ctx) {
+        if (!ctx.poster().getId().equals(ctx.task().getPosterUserId())) {
+            return Mono.error(new UnauthorizedAccessException("You are not the owner of this task."));
+        }
+        if (TaskStatus.OPEN != ctx.task().getStatus()) {
+            return Mono.error(new IllegalBidException("This task is no longer OPEN."));
+        }
+        return Mono.just(ctx);
+    }
+
+    // --- Payment Processing ---
+    private Mono<AcceptBidContext> processPayment(AcceptBidContext ctx, String token) {
+        BigDecimal amount = BigDecimal.valueOf(ctx.bid().getAmount());
+
+        return getUserUuid(token, ctx.task().getPosterUserId())
+                .flatMap(posterUuid -> holdFunds(token, posterUuid, amount, ctx.task().getId()))
+                .thenReturn(ctx) // Return context if successful
+                .onErrorResume(WebClientResponseException.class, e -> {
+                    if (e.getStatusCode().is4xxClientError() || e.getStatusCode().is5xxServerError()) {
+                        return Mono.error(new IllegalStateException("Payment Failed: Insufficient funds or wallet error."));
+                    }
+                    return Mono.error(e);
+                });
+    }
+
+    // --- Finalize (DB Update & Notify) ---
+    private Mono<Void> finalizeOrder(AcceptBidContext ctx, String token) {
+        return assignTask(token, ctx.task().getId(), ctx.bid().getBidderUserId())
+                .then(Mono.defer(() ->
+                        self.processAndNotifyBids(ctx.bid(), ctx.task(), token)
+                ));
+    }
+
+    // --- Internal Record to hold state ---
+    private record AcceptBidContext(Bid bid, UserDTO poster, TaskDTO task) {}
 
     @Transactional(readOnly = true)
     public Mono<List<MyBidDetailDTO>> getMyBids() {
@@ -327,6 +357,31 @@ public class BidService {
                 .header(AUTHORIZATION, AUTHORIZATION_BEARER + token)
                 .retrieve()
                 .bodyToMono(TaskDTO.class);
+    }
+
+    // --- Get UUID for Wallet ---
+    private Mono<UUID> getUserUuid(String token, Long userId) {
+        return webClientBuilder.build()
+                .get()
+                .uri("http://user-service/api/v1/users/" + userId)
+                .header(AUTHORIZATION, AUTHORIZATION_BEARER + token)
+                .retrieve()
+                .bodyToMono(UserDTO.class)
+                .map(UserDTO::getKeycloakId); // Requires UserDTO to have 'keycloakId'
+    }
+
+    // --- Hold Funds Helper ---
+    private Mono<Void> holdFunds(String token, UUID userId, BigDecimal amount, Long taskId) {
+        // Inner Record for the Request Body
+        record HoldRequest(UUID userId, BigDecimal amount, Long taskId) {}
+
+        return webClientBuilder.build()
+                .post()
+                .uri("http://wallet-service/api/v1/wallet/hold")
+                .header(AUTHORIZATION, AUTHORIZATION_BEARER + token)
+                .bodyValue(new HoldRequest(userId, amount, taskId))
+                .retrieve()
+                .bodyToMono(Void.class);
     }
 
     private Mono<Map<Long, UserDTO>> getBatchUsers(String token, List<Long> bidderIds) {
