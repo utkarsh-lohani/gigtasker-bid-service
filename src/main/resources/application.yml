@@ -1,8 +1,27 @@
 spring:
   application:
     name: bid-service
+
+---
+# ==========================================
+# PROFILE: DEFAULT (Local/IntelliJ)
+# ==========================================
+# Active when no specific profile is set (e.g. running in IDE)
+spring:
   config:
-    # 1. "optional:" means: if server is down, don't crash (good for local)
-    # 2. "configserver:" is the protocol
-    # 3. The URL
-    import: "optional:configserver:${CONFIG_SERVER_URL:http://localhost:8888}"
+    activate:
+      on-profile: default
+    # Localhost fallback
+    import: "optional:configserver:http://localhost:8888"
+
+---
+# ==========================================
+# PROFILE: DOCKER (Production/Container)
+# ==========================================
+# Active when SPRING_PROFILES_ACTIVE=docker
+spring:
+  config:
+    activate:
+      on-profile: docker
+    # Docker DNS Name
+    import: "optional:configserver:http://config-server:8888"
